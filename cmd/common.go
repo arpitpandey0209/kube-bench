@@ -16,10 +16,13 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/aquasecurity/kube-bench/check"
@@ -29,7 +32,6 @@ import (
 
 // NewRunFilter constructs a Predicate based on FilterOpts which determines whether tested Checks should be run or not.
 func NewRunFilter(opts FilterOpts) (check.Predicate, error) {
-
 	if opts.CheckList != "" && opts.GroupList != "" {
 		return nil, fmt.Errorf("group option and check option can't be used together")
 	}
@@ -62,30 +64,33 @@ func NewRunFilter(opts FilterOpts) (check.Predicate, error) {
 	}, nil
 }
 
-func runChecks(nodetype check.NodeType) {
-	var summary check.Summary
-
+func runChecks(nodetype check.NodeType, testYamlFile string) {
 	// Verify config file was loaded into Viper during Cobra sub-command initialization.
 	if configFileError != nil {
 		colorPrint(check.FAIL, fmt.Sprintf("Failed to read config file: %v\n", configFileError))
 		os.Exit(1)
 	}
 
-	def := loadConfig(nodetype)
-	in, err := ioutil.ReadFile(def)
+	in, err := ioutil.ReadFile(testYamlFile)
 	if err != nil {
-		exitWithError(fmt.Errorf("error opening %s controls file: %v", nodetype, err))
+		exitWithError(fmt.Errorf("error opening %s test file: %v", testYamlFile, err))
 	}
 
-	glog.V(1).Info(fmt.Sprintf("Using benchmark file: %s\n", def))
+	glog.V(1).Info(fmt.Sprintf("Using test file: %s\n", testYamlFile))
 
-	// Get the set of executables and config files we care about on this type of node.
+	// Get the viper config for this section of tests
 	typeConf := viper.Sub(string(nodetype))
-	binmap, err := getBinaries(typeConf)
+	if typeConf == nil {
+		colorPrint(check.FAIL, fmt.Sprintf("No config settings for %s\n", string(nodetype)))
+		os.Exit(1)
+	}
 
-	// Checks that the executables we need for the node type are running.
+	// Get the set of executables we need for this section of the tests
+	binmap, err := getBinaries(typeConf, nodetype)
+
+	// Checks that the executables we need for the section are running.
 	if err != nil {
-		exitWithError(err)
+		glog.V(1).Info(fmt.Sprintf("failed to get a set of executables needed for tests: %v", err))
 	}
 
 	confmap := getFiles(typeConf, "config")
@@ -112,29 +117,18 @@ func runChecks(nodetype check.NodeType) {
 		exitWithError(fmt.Errorf("error setting up run filter: %v", err))
 	}
 
-	summary = controls.RunChecks(runner, filter)
+	controls.RunChecks(runner, filter, parseSkipIds(skipIds))
+	controlsCollection = append(controlsCollection, controls)
+}
 
-	// if we successfully ran some tests and it's json format, ignore the warnings
-	if (summary.Fail > 0 || summary.Warn > 0 || summary.Pass > 0 || summary.Info > 0) && jsonFmt {
-		out, err := controls.JSON()
-		if err != nil {
-			exitWithError(fmt.Errorf("failed to output in JSON format: %v", err))
-		}
-
-		PrintOutput(string(out), outputFile)
-	} else {
-		// if we want to store in PostgreSQL, convert to JSON and save it
-		if (summary.Fail > 0 || summary.Warn > 0 || summary.Pass > 0 || summary.Info > 0) && pgSQL {
-			out, err := controls.JSON()
-			if err != nil {
-				exitWithError(fmt.Errorf("failed to output in JSON format: %v", err))
-			}
-
-			savePgsql(string(out))
-		} else {
-			prettyPrint(controls, summary)
+func parseSkipIds(skipIds string) map[string]bool {
+	var skipIdMap =  make(map[string]bool, 0)
+	if skipIds != "" {
+		for _, id := range strings.Split(skipIds, ",") {
+			skipIdMap[strings.Trim(id, " ")] = true
 		}
 	}
+	return skipIdMap
 }
 
 // colorPrint outputs the state in a specific colour, along with a message string
@@ -168,8 +162,16 @@ func prettyPrint(r *check.Controls, summary check.Summary) {
 			colors[check.WARN].Printf("== Remediations ==\n")
 			for _, g := range r.Groups {
 				for _, c := range g.Checks {
-					if c.State == check.FAIL || c.State == check.WARN {
+					if c.State == check.FAIL {
 						fmt.Printf("%s %s\n", c.ID, c.Remediation)
+					}
+					if c.State == check.WARN {
+						// Print the error if test failed due to problem with the audit command
+						if c.Reason != "" && c.Type != "manual" {
+							fmt.Printf("%s audit test did not run: %s\n", c.ID, c.Reason)
+						} else {
+							fmt.Printf("%s %s\n", c.ID, c.Remediation)
+						}
 					}
 				}
 			}
@@ -198,7 +200,7 @@ func prettyPrint(r *check.Controls, summary check.Summary) {
 // loadConfig finds the correct config dir based on the kubernetes version,
 // merges any specific config.yaml file found with the main config
 // and returns the benchmark file to use.
-func loadConfig(nodetype check.NodeType) string {
+func loadConfig(nodetype check.NodeType, benchmarkVersion string) string {
 	var file string
 	var err error
 
@@ -207,55 +209,206 @@ func loadConfig(nodetype check.NodeType) string {
 		file = masterFile
 	case check.NODE:
 		file = nodeFile
+	case check.CONTROLPLANE:
+		file = controlplaneFile
+	case check.ETCD:
+		file = etcdFile
+	case check.POLICIES:
+		file = policiesFile
+	case check.MANAGEDSERVICES:
+		file = managedservicesFile
 	}
 
-	runningVersion := ""
-	if kubeVersion == "" {
-		runningVersion, err = getKubeVersion()
-		if err != nil {
-			exitWithError(fmt.Errorf("Version check failed: %s\nAlternatively, you can specify the version with --version", err))
-		}
-	}
-
-	path, err := getConfigFilePath(kubeVersion, runningVersion, file)
+	path, err := getConfigFilePath(benchmarkVersion, file)
 	if err != nil {
 		exitWithError(fmt.Errorf("can't find %s controls file in %s: %v", nodetype, cfgDir, err))
 	}
 
-	// Merge kubernetes version specific config if any.
+	// Merge version-specific config if any.
+	mergeConfig(path)
+
+	return filepath.Join(path, file)
+}
+
+func mergeConfig(path string) error {
 	viper.SetConfigFile(path + "/config.yaml")
-	err = viper.MergeInConfig()
+	err := viper.MergeInConfig()
 	if err != nil {
 		if os.IsNotExist(err) {
 			glog.V(2).Info(fmt.Sprintf("No version-specific config.yaml file in %s", path))
 		} else {
-			exitWithError(fmt.Errorf("couldn't read config file %s: %v", path+"/config.yaml", err))
+			return fmt.Errorf("couldn't read config file %s: %v", path+"/config.yaml", err)
 		}
-	} else {
-		glog.V(1).Info(fmt.Sprintf("Using config file: %s\n", viper.ConfigFileUsed()))
 	}
-	return filepath.Join(path, file)
+
+	glog.V(1).Info(fmt.Sprintf("Using config file: %s\n", viper.ConfigFileUsed()))
+
+	return nil
+}
+
+func mapToBenchmarkVersion(kubeToBenchmarkMap map[string]string, kv string) (string, error) {
+	kvOriginal := kv
+	cisVersion, found := kubeToBenchmarkMap[kv]
+	glog.V(2).Info(fmt.Sprintf("mapToBenchmarkVersion for k8sVersion: %q cisVersion: %q found: %t\n", kv, cisVersion, found))
+	for !found && (kv != defaultKubeVersion && !isEmpty(kv)) {
+		kv = decrementVersion(kv)
+		cisVersion, found = kubeToBenchmarkMap[kv]
+		glog.V(2).Info(fmt.Sprintf("mapToBenchmarkVersion for k8sVersion: %q cisVersion: %q found: %t\n", kv, cisVersion, found))
+	}
+
+	if !found {
+		glog.V(1).Info(fmt.Sprintf("mapToBenchmarkVersion unable to find a match for: %q", kvOriginal))
+		glog.V(3).Info(fmt.Sprintf("mapToBenchmarkVersion kubeToBenchmarkMap: %#v", kubeToBenchmarkMap))
+		return "", fmt.Errorf("unable to find a matching Benchmark Version match for kubernetes version: %s", kvOriginal)
+	}
+
+	return cisVersion, nil
+}
+
+func loadVersionMapping(v *viper.Viper) (map[string]string, error) {
+	kubeToBenchmarkMap := v.GetStringMapString("version_mapping")
+	if kubeToBenchmarkMap == nil || (len(kubeToBenchmarkMap) == 0) {
+		return nil, fmt.Errorf("config file is missing 'version_mapping' section")
+	}
+
+	return kubeToBenchmarkMap, nil
+}
+
+func loadTargetMapping(v *viper.Viper) (map[string][]string, error) {
+	benchmarkVersionToTargetsMap := v.GetStringMapStringSlice("target_mapping")
+	if len(benchmarkVersionToTargetsMap) == 0 {
+		return nil, fmt.Errorf("config file is missing 'target_mapping' section")
+	}
+
+	return benchmarkVersionToTargetsMap, nil
+}
+
+func getBenchmarkVersion(kubeVersion, benchmarkVersion string, v *viper.Viper) (bv string, err error) {
+	if !isEmpty(kubeVersion) && !isEmpty(benchmarkVersion) {
+		return "", fmt.Errorf("It is an error to specify both --version and --benchmark flags")
+	}
+
+	if isEmpty(benchmarkVersion) {
+		if isEmpty(kubeVersion) {
+			kubeVersion, err = getKubeVersion()
+			if err != nil {
+				return "", fmt.Errorf("Version check failed: %s\nAlternatively, you can specify the version with --version", err)
+			}
+		}
+
+		kubeToBenchmarkMap, err := loadVersionMapping(v)
+		if err != nil {
+			return "", err
+		}
+
+		benchmarkVersion, err = mapToBenchmarkVersion(kubeToBenchmarkMap, kubeVersion)
+		if err != nil {
+			return "", err
+		}
+
+		glog.V(2).Info(fmt.Sprintf("Mapped Kubernetes version: %s to Benchmark version: %s", kubeVersion, benchmarkVersion))
+	}
+
+	glog.V(1).Info(fmt.Sprintf("Kubernetes version: %q to Benchmark version: %q", kubeVersion, benchmarkVersion))
+	return benchmarkVersion, nil
 }
 
 // isMaster verify if master components are running on the node.
 func isMaster() bool {
-	glog.V(2).Info("Checking if the current node is running master components")
-	masterConf := viper.Sub(string(check.MASTER))
-	if masterConf == nil {
-		glog.V(2).Info("No master components found to be running")
+	return isThisNodeRunning(check.MASTER)
+}
+
+// isEtcd verify if etcd components are running on the node.
+func isEtcd() bool {
+	return isThisNodeRunning(check.ETCD)
+}
+
+func isThisNodeRunning(nodeType check.NodeType) bool {
+	glog.V(3).Infof("Checking if the current node is running %s components", nodeType)
+	nodeTypeConf := viper.Sub(string(nodeType))
+	if nodeTypeConf == nil {
+		glog.V(2).Infof("No config for %s components found", nodeType)
 		return false
 	}
-	components, err := getBinariesFunc(masterConf)
 
+	components, err := getBinariesFunc(nodeTypeConf, nodeType)
 	if err != nil {
-		glog.V(2).Info(err)
+		glog.V(2).Infof("Failed to find %s binaries: %v", nodeType, err)
 		return false
 	}
 	if len(components) == 0 {
-		glog.V(2).Info("No master binaries specified")
+		glog.V(2).Infof("No %s binaries specified", nodeType)
 		return false
 	}
+
+	glog.V(2).Infof("Node is running %s components", nodeType)
 	return true
+}
+
+func exitCodeSelection(controlsCollection []*check.Controls) int {
+	for _, control := range controlsCollection {
+		if control.Fail > 0  {
+			return exitCode
+		}
+	}
+
+	return 0
+}
+
+func writeOutput(controlsCollection []*check.Controls) {
+	sort.Slice(controlsCollection, func(i, j int) bool {
+		iid, _ := strconv.Atoi(controlsCollection[i].ID)
+		jid, _ := strconv.Atoi(controlsCollection[j].ID)
+		return iid < jid
+	})
+	if junitFmt {
+		writeJunitOutput(controlsCollection)
+		return
+	}
+	if jsonFmt {
+		writeJSONOutput(controlsCollection)
+		return
+	}
+	if pgSQL {
+		writePgsqlOutput(controlsCollection)
+		return
+	}
+	writeStdoutOutput(controlsCollection)
+}
+
+func writeJSONOutput(controlsCollection []*check.Controls) {
+	out, err := json.Marshal(controlsCollection)
+	if err != nil {
+		exitWithError(fmt.Errorf("failed to output in JSON format: %v", err))
+	}
+	printOutput(string(out), outputFile)
+}
+
+func writeJunitOutput(controlsCollection []*check.Controls) {
+	for _, controls := range controlsCollection {
+		out, err := controls.JUnit()
+		if err != nil {
+			exitWithError(fmt.Errorf("failed to output in JUnit format: %v", err))
+		}
+		printOutput(string(out), outputFile)
+	}
+}
+
+func writePgsqlOutput(controlsCollection []*check.Controls) {
+	for _, controls := range controlsCollection {
+		out, err := controls.JSON()
+		if err != nil {
+			exitWithError(fmt.Errorf("failed to output in Postgresql format: %v", err))
+		}
+		savePgsql(string(out))
+	}
+}
+
+func writeStdoutOutput(controlsCollection []*check.Controls) {
+	for _, controls := range controlsCollection {
+		summary := controls.Summary
+		prettyPrint(controls, summary)
+	}
 }
 
 func printRawOutput(output string) {
@@ -276,8 +429,8 @@ func writeOutputToFile(output string, outputFile string) error {
 	return w.Flush()
 }
 
-func PrintOutput(output string, outputFile string) {
-	if len(outputFile) == 0 {
+func printOutput(output string, outputFile string) {
+	if outputFile == "" {
 		fmt.Println(output)
 	} else {
 		err := writeOutputToFile(output, outputFile)
@@ -285,4 +438,33 @@ func PrintOutput(output string, outputFile string) {
 			exitWithError(fmt.Errorf("Failed to write to output file %s: %v", outputFile, err))
 		}
 	}
+}
+
+// validTargets helps determine if the targets
+// are legitimate for the benchmarkVersion.
+func validTargets(benchmarkVersion string, targets []string, v *viper.Viper) (bool, error) {
+	benchmarkVersionToTargetsMap, err := loadTargetMapping(v)
+	if err != nil {
+		return false, err
+	}
+	providedTargets, found := benchmarkVersionToTargetsMap[benchmarkVersion]
+	if !found {
+		return false, fmt.Errorf("No targets configured for %s", benchmarkVersion)
+	}
+
+	for _, pt := range targets {
+		f := false
+		for _, t := range providedTargets {
+			if pt == strings.ToLower(t) {
+				f = true
+				break
+			}
+		}
+
+		if !f {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
